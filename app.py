@@ -10,6 +10,7 @@ import struct
 import time
 import uuid
 import threading
+import gc
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -39,7 +40,7 @@ except Exception:
 
 
 # ==========================================
-# টার্মিনাল কালার ও লগিং
+# টার্মিনাল কালার
 # ==========================================
 class Color:
     GREEN = "\033[1;92m"
@@ -52,10 +53,10 @@ class Color:
     RESET = "\033[0m"
     BOLD = "\033[1m"
 
-def log_success(text: str): print(f"{Color.GREEN}[✓] {text}{Color.RESET}")
-def log_error(text: str):   print(f"{Color.RED}[✗] {text}{Color.RESET}")
-def log_warn(text: str):    print(f"{Color.YELLOW}[!] {text}{Color.RESET}")
-def log_info(text: str):    print(f"{Color.CYAN}[i] {text}{Color.RESET}")
+def log_success(text: str): print(f"{Color.GREEN}[✓] {text}{Color.RESET}", flush=True)
+def log_error(text: str):   print(f"{Color.RED}[✗] {text}{Color.RESET}", flush=True)
+def log_warn(text: str):    print(f"{Color.YELLOW}[!] {text}{Color.RESET}", flush=True)
+def log_info(text: str):    print(f"{Color.CYAN}[i] {text}{Color.RESET}", flush=True)
 
 def log_banner():
     banner = f"""
@@ -64,7 +65,7 @@ def log_banner():
 ║  {Color.GREEN}3-GROUP CYCLE: {Color.YELLOW}25s | 30s | 35s{Color.GREEN} | REFRESH: {Color.YELLOW}5H{Color.GREEN} | STATUS: ACTIVE{Color.MAGENTA}  ║
 ╚════════════════════════════════════════════════════════════════╝{Color.RESET}
 """
-    print(banner)
+    print(banner, flush=True)
 
 
 # ==========================================
@@ -77,11 +78,8 @@ TOKEN_CACHE_TTL = 1200
 MAX_LOGIN_THREADS = 10
 MAX_LOGIN_ATTEMPTS = 2
 
-# ৩টি গ্রুপের সাইকেল টাইম (সেকেন্ড)
 GROUP_LIFETIMES = [25.0, 30.0, 35.0]
-
-# ৫ ঘন্টা পর পুরো রিফ্রেশ
-FULL_REFRESH_INTERVAL = 5 * 60 * 60  # 18000 সেকেন্ড
+FULL_REFRESH_INTERVAL = 5 * 60 * 60  # ৫ ঘন্টা
 
 AES_KEY = b'Yg&tc%DEuh6%Zc^8'
 AES_IV = b'6oyZDr22E3ychjM%'
@@ -107,15 +105,16 @@ _THREAD_SEMAPHORE = asyncio.Semaphore(MAX_LOGIN_THREADS)
 
 online_count = 0
 total_accounts = 0
-active_accounts = []
 current_release_ver = "OB55"
 current_client_ver = "1.132.6"
 state_lock = threading.Lock()
 
 
 # ==========================================
-# ১. ডিভাইস প্রোফাইল
+# ১. ডিভাইস প্রোফাইল (লিমিটেড ক্যাশ)
 # ==========================================
+_MAX_DEVICES = 500  # ডিভাইস ফাইল বড় না হওয়ার জন্য
+
 def _generate_new_device() -> dict:
     device_list = [
         ("Xiaomi", "M2006C3LII", "PowerVR Rogue GE8320", "Android OS 10 / API-29 (QP1A.190711.020/V12.0.26.0.QCDINXM)"),
@@ -152,9 +151,14 @@ def get_device_for_account(account_identifier: str) -> dict:
         return devices[acc_key]
     new_device = _generate_new_device()
     devices[acc_key] = new_device
+    # লিমিট ছাড়ালে পুরোনো এন্ট্রি বাদ
+    if len(devices) > _MAX_DEVICES:
+        keys = list(devices.keys())
+        for k in keys[:len(devices) - _MAX_DEVICES]:
+            devices.pop(k, None)
     try:
         with open(DEVICES_FILE, "w", encoding="utf-8") as f:
-            json.dump(devices, f, indent=4)
+            json.dump(devices, f, indent=2)
     except Exception:
         pass
     return new_device
@@ -252,13 +256,13 @@ async def safe_close_writer(writer):
     try:
         if not writer.is_closing():
             writer.close()
-        await asyncio.wait_for(writer.wait_closed(), timeout=1.5)
+        await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
     except Exception:
         pass
 
 
 # ==========================================
-# ৩. ক্যাশ + প্রোটোবাফ হেল্পার
+# ৩. ক্যাশ হেল্পার
 # ==========================================
 def _json_serializer(obj):
     if isinstance(obj, (bytes, bytearray)):
@@ -293,7 +297,7 @@ def _save_token_cache(cache: Dict[str, Any]):
     try:
         tmp_file = TOKEN_CACHE_FILE + ".tmp"
         with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2, default=_json_serializer)
+            json.dump(cache, f, default=_json_serializer)
         os.replace(tmp_file, TOKEN_CACHE_FILE)
     except Exception:
         pass
@@ -327,12 +331,14 @@ def cache_invalidate(uid: str):
         _save_token_cache(cache)
 
 def clear_all_cache():
-    """৫ ঘন্টা পর পুরো ক্যাশ ক্লিয়ার"""
+    """৫ ঘন্টা পর পুরো ক্যাশ ক্লিয়ার — ক্যাশ জমতে দেয় না"""
     try:
         if os.path.exists(TOKEN_CACHE_FILE):
             os.remove(TOKEN_CACHE_FILE)
     except Exception:
         pass
+    _DNS_CACHE.clear()
+    gc.collect()
 
 async def aes_encrypt(payload, key, iv):
     cipher = AES.new(key, AES.MODE_CBC, iv)
@@ -743,13 +749,7 @@ async def process_account_token(access_token: str) -> Optional[Dict]:
 # ৬. গ্লোবাল অনলাইন কিপার (৩-গ্রুপ সাইকেল)
 # ==========================================
 async def run_account_online_worker(account_data: Dict, group_index: int, stop_event: asyncio.Event):
-    """
-    group_index 0 → ২৫ সেকেন্ড সাইকেল
-    group_index 1 → ৩০ সেকেন্ড সাইকেল
-    group_index 2 → ৩৫ সেকেন্ড সাইকেল
-    stop_event সেট হলে ২-৩ সেকেন্ডের মধ্যে বন্ধ হয়ে যাবে
-    """
-    global online_count, active_accounts
+    global online_count
 
     acc_id = str(account_data['account_id'])
     nickname = account_data.get('nickname', 'Player')
@@ -764,19 +764,13 @@ async def run_account_online_worker(account_data: Dict, group_index: int, stop_e
     ip, port = func_addrs.split(":")
     key = account_data['aes_ak']
     iv = account_data['iv_i']
-    uid_str = account_data.get('auth_uid', acc_id)
 
     cycle_lifetime = GROUP_LIFETIMES[group_index]
 
     with state_lock:
         online_count += 1
-        active_accounts.append({
-            'uid': uid_str, 'bot_uid': acc_id,
-            'region': region, 'group': group_index + 1,
-            'time': datetime.now().strftime('%H:%M:%S')
-        })
 
-    log_success(f"ONLINE 24/7 -> ID: {Color.WHITE}{acc_id}{Color.GREEN} | Name: {Color.YELLOW}{nickname}{Color.GREEN} | Lvl: {Color.WHITE}{level}{Color.GREEN} | Reg: {Color.BLUE}{region}{Color.GREEN} | Group: {Color.MAGENTA}G{group_index+1} ({cycle_lifetime:.0f}s){Color.GREEN}")
+    log_success(f"ONLINE -> ID: {Color.WHITE}{acc_id}{Color.GREEN} | Name: {Color.YELLOW}{nickname}{Color.GREEN} | Lvl: {Color.WHITE}{level}{Color.GREEN} | Reg: {Color.BLUE}{region}{Color.GREEN} | Group: {Color.MAGENTA}G{group_index+1} ({cycle_lifetime:.0f}s){Color.GREEN}")
 
     try:
         while not stop_event.is_set():
@@ -789,11 +783,16 @@ async def run_account_online_worker(account_data: Dict, group_index: int, stop_e
                     region=region, typ='OnLine'
                 )
                 resolved_ip = await resolve_host_cloudflare(ip)
+
+                # কানেকশন তৈরি
                 reader, writer = await asyncio.open_connection(resolved_ip, int(port))
                 raw_sock = writer.get_extra_info('socket')
                 if raw_sock:
                     optimize_tcp_socket(raw_sock)
 
+                # স্টার্টআপ প্যাকেট
+                if writer.is_closing():
+                    raise ConnectionError("Socket closed right after connect")
                 writer.write(bytes.fromhex(tcp_startup))
                 await writer.drain()
 
@@ -806,9 +805,11 @@ async def run_account_online_worker(account_data: Dict, group_index: int, stop_e
 
                 while not stop_event.is_set():
                     # ==========================================
-                    # গ্লোবাল স্কোয়াড সাইকেল (Squad + Recruit + Leave)
+                    # স্কোয়াড তৈরি
                     # ==========================================
                     try:
+                        if writer.is_closing():
+                            raise ConnectionError("Socket closed")
                         open_sq_pkt = OpEnSq(key, iv, region, current_client_ver)
                         if asyncio.iscoroutine(open_sq_pkt):
                             open_sq_pkt = await open_sq_pkt
@@ -817,10 +818,17 @@ async def run_account_online_worker(account_data: Dict, group_index: int, stop_e
                             await writer.drain()
                             log_info(f"[{acc_id}] Squad Created ✅ (G{group_index+1})")
                             await asyncio.sleep(0.3)
+                    except (ConnectionError, OSError):
+                        raise
                     except Exception:
                         pass
 
+                    # ==========================================
+                    # স্কোয়াড সাইজ
+                    # ==========================================
                     try:
+                        if writer.is_closing():
+                            raise ConnectionError("Socket closed")
                         sq_size_pkt = cHSq22(4, acc_id, key, iv, region)
                         if asyncio.iscoroutine(sq_size_pkt):
                             sq_size_pkt = await sq_size_pkt
@@ -828,10 +836,17 @@ async def run_account_online_worker(account_data: Dict, group_index: int, stop_e
                             writer.write(sq_size_pkt)
                             await writer.drain()
                             await asyncio.sleep(0.3)
+                    except (ConnectionError, OSError):
+                        raise
                     except Exception:
                         pass
 
+                    # ==========================================
+                    # ওয়ার্ল্ড রিক্রুট
+                    # ==========================================
                     try:
+                        if writer.is_closing():
+                            raise ConnectionError("Socket closed")
                         recruit_pkt = MAHIR_World_Recruit_Packet(acc_id, key, iv)
                         if asyncio.iscoroutine(recruit_pkt):
                             recruit_pkt = await recruit_pkt
@@ -840,10 +855,14 @@ async def run_account_online_worker(account_data: Dict, group_index: int, stop_e
                             await writer.drain()
                             log_info(f"[{acc_id}] World Recruit Sent 📢 (G{group_index+1})")
                             await asyncio.sleep(0.3)
+                    except (ConnectionError, OSError):
+                        raise
                     except Exception:
                         pass
 
-                    # নির্দিষ্ট গ্রুপের টাইম পর্যন্ত অপেক্ষা (২৫/৩০/৩৫ সেকেন্ড)
+                    # ==========================================
+                    # নির্দিষ্ট গ্রুপের সময় পর্যন্ত অপেক্ষা
+                    # ==========================================
                     elapsed = 0.0
                     while elapsed < cycle_lifetime and not stop_event.is_set():
                         try:
@@ -856,16 +875,24 @@ async def run_account_online_worker(account_data: Dict, group_index: int, stop_e
                         if stop_event.is_set():
                             break
                         try:
+                            if writer.is_closing():
+                                raise ConnectionError("Socket closed")
                             writer.write(ka_bytes)
                             await writer.drain()
+                        except (ConnectionError, OSError):
+                            raise
                         except Exception:
-                            break
+                            pass
 
                     if stop_event.is_set():
                         break
 
+                    # ==========================================
                     # স্কোয়াড লিভ
+                    # ==========================================
                     try:
+                        if writer.is_closing():
+                            raise ConnectionError("Socket closed")
                         chsq_pkt = cHSq(4, acc_id, key, iv, region)
                         if asyncio.iscoroutine(chsq_pkt):
                             chsq_pkt = await chsq_pkt
@@ -881,6 +908,8 @@ async def run_account_online_worker(account_data: Dict, group_index: int, stop_e
                             writer.write(leave_pkt)
                             await writer.drain()
                             log_info(f"[{acc_id}] Left Squad 🚪 after {cycle_lifetime:.1f}s (G{group_index+1})")
+                    except (ConnectionError, OSError):
+                        raise
                     except Exception:
                         pass
 
@@ -893,22 +922,27 @@ async def run_account_online_worker(account_data: Dict, group_index: int, stop_e
                         pass
 
             except asyncio.CancelledError:
-                await safe_close_writer(writer)
                 raise
-            except Exception as e:
-                if not stop_event.is_set():
-                    log_warn(f"Connection lost for {acc_id} ({e}). Reconnecting in 5s...")
+            except Exception:
+                # নীরব reconnect — কনসোল স্প্যাম হবে না
+                pass
+            finally:
                 await safe_close_writer(writer)
-                if not stop_event.is_set():
-                    try:
-                        await asyncio.wait_for(asyncio.sleep(5.0), timeout=5.5)
-                    except asyncio.TimeoutError:
-                        pass
+                writer = None
+
+            if stop_event.is_set():
+                break
+            # reconnect delay
+            try:
+                await asyncio.wait_for(asyncio.sleep(2.0), timeout=3.0)
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                raise
 
     finally:
         with state_lock:
             online_count = max(0, online_count - 1)
-            active_accounts[:] = [a for a in active_accounts if a['uid'] != uid_str]
 
 
 # ==========================================
@@ -1002,9 +1036,7 @@ async def main():
         total_accounts = len(accounts)
         log_info(f"Loaded {Color.WHITE}{total_accounts}{Color.CYAN} accounts. Creating tokens with {Color.YELLOW}{MAX_LOGIN_THREADS} threads{Color.CYAN}...")
 
-        # ==========================================
-        # ধাপ ১: সব অ্যাকাউন্টের টোকেন তৈরি (একসাথে)
-        # ==========================================
+        # ধাপ ১: সব টোকেন একসাথে
         token_tasks = []
         for idx, acc in enumerate(accounts, start=1):
             t = asyncio.create_task(create_token_for_account(acc, idx, total_accounts))
@@ -1013,7 +1045,7 @@ async def main():
         token_results = await asyncio.gather(*token_tasks, return_exceptions=True)
 
         valid_accounts = []
-        for i, res in enumerate(token_results):
+        for res in token_results:
             if isinstance(res, dict) and res.get('account_id'):
                 valid_accounts.append(res)
 
@@ -1025,9 +1057,7 @@ async def main():
         log_success(f"Token creation complete! {Color.WHITE}{len(valid_accounts)}{Color.GREEN}/{total_accounts} accounts ready.")
         log_info(f"Grouping into 3 groups: 25s | 30s | 35s ...")
 
-        # ==========================================
-        # ধাপ ২: ৩টি গ্রুপে ভাগ করা
-        # ==========================================
+        # ধাপ ২: ৩ গ্রুপে ভাগ
         groups: List[List[Tuple[int, Dict]]] = [[], [], []]
         for i, acc_data in enumerate(valid_accounts):
             group_idx = i % 3
@@ -1036,9 +1066,7 @@ async def main():
         for g in range(3):
             log_info(f"Group {g+1}: {len(groups[g])} accounts | Cycle: {GROUP_LIFETIMES[g]:.0f}s")
 
-        # ==========================================
-        # ধাপ ৩: সব অ্যাকাউন্ট একসাথে অনলাইনে
-        # ==========================================
+        # ধাপ ৩: সব অ্যাকাউন্ট একসাথে অনলাইন
         stop_event = asyncio.Event()
         online_tasks = []
         for group_idx in range(3):
@@ -1050,20 +1078,16 @@ async def main():
 
         log_success(f"ALL {Color.WHITE}{len(valid_accounts)}{Color.GREEN} ACCOUNTS ARE NOW ONLINE! 24/7 KEEPER ACTIVE.")
 
-        # ==========================================
         # ধাপ ৪: ৫ ঘন্টা অপেক্ষা
-        # ==========================================
         refresh_start = time.time()
         while True:
             elapsed = time.time() - refresh_start
             if elapsed >= FULL_REFRESH_INTERVAL:
                 log_warn(f"5 Hours completed! Refreshing all {len(valid_accounts)} accounts...")
                 break
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)
 
-        # ==========================================
         # ধাপ ৫: ২-৩ সেকেন্ডের জন্য সব বন্ধ
-        # ==========================================
         log_warn("Stopping all sessions for 2-3 seconds...")
         stop_event.set()
 
@@ -1073,6 +1097,7 @@ async def main():
 
         await asyncio.sleep(random.uniform(2.0, 3.0))
 
+        # ক্যাশ ক্লিয়ার
         clear_all_cache()
         log_success("All sessions stopped. Cache cleared. Restarting...")
 
